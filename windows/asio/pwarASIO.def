@@ -1,9 +1,6 @@
-LIBRARY			pwarASIO
-DESCRIPTION		'PipeWire ASIO Relay'
-PROTMODE
-EXPORTS	
-				DllMain
-				DllGetClassObject
-				DllCanUnloadNow
-				DllRegisterServer
-				DllUnregisterServer
+LIBRARY PWARASIO
+EXPORTS
+    DllGetClassObject PRIVATE
+    DllCanUnloadNow PRIVATE
+    DllRegisterServer PRIVATE
+    DllUnregisterServer PRIVATE

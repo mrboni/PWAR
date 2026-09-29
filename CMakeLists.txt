@@ -10,6 +10,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Platform-specific builds
 if(WIN32)
+    include(CTest)
     # Windows-specific targets
     add_subdirectory(windows/asio)
     add_subdirectory(windows/torture)

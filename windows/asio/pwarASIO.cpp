@@ -125,14 +125,11 @@ pwarASIO::pwarASIO(LPUNKNOWN pUnk, HRESULT* phr)
     
     parseConfigFile();
     initUdpSender();
-    startUdpListener();
 }
 
 pwarASIO::~pwarASIO() {
-    closeUdpSender();
-    stopUdpListener();
-    stop();
     disposeBuffers();
+    closeUdpSender();
 }
 
 void pwarASIO::getDriverName(char* name) {
@@ -140,7 +137,7 @@ void pwarASIO::getDriverName(char* name) {
 }
 
 long pwarASIO::getDriverVersion() {
-    return 0x00000001L;
+    return 0x00000201L;
 }
 
 void pwarASIO::getErrorMessage(char* string) {
@@ -149,6 +146,10 @@ void pwarASIO::getErrorMessage(char* string) {
 
 ASIOBool pwarASIO::init(void* sysRef) {
     (void)sysRef;  // Unused parameter
+    if (udpSendSocket == INVALID_SOCKET) {
+        strcpy(errorMessage, "Could not initialize the PWAR UDP sender");
+        return ASIOFalse;
+    }
     
     // Verify that our constants are valid
     if (kMinBlockFrames <= 0 || kMaxBlockFrames <= kMinBlockFrames || 
@@ -163,15 +164,23 @@ ASIOBool pwarASIO::init(void* sysRef) {
 
 ASIOError pwarASIO::start() {
     if (!callbacks) return ASE_NotPresent;
-    started = false;
+    if (started) return ASE_OK;
     samplePosition = 0;
     theSystemTime.lo = theSystemTime.hi = 0;
     toggle = 0;
+    pwar_router_init(&router, PWAR_MAX_CHANNELS);
     started = true;
+    if (!startUdpListener()) {
+        started = false;
+        return ASE_HWMalfunction;
+    }
     return ASE_OK;
 }
 
 ASIOError pwarASIO::stop() {
+    // Join before the host can release callbacks or buffers. The stop event
+    // also wakes an idle receiver, without depending on a packet from the Pi.
+    stopUdpListener();
     started = false;
     return ASE_OK;
 }
@@ -215,6 +224,7 @@ ASIOError pwarASIO::getSampleRate(ASIOSampleRate* sampleRate) {
 
 ASIOError pwarASIO::setSampleRate(ASIOSampleRate sampleRate) {
     if (sampleRate != 44100.0 && sampleRate != 48000.0) return ASE_NoClock;
+    if (started && sampleRate != this->sampleRate) return ASE_InvalidMode;
     if (sampleRate != this->sampleRate) {
         this->sampleRate = sampleRate;
         asioTime.timeInfo.sampleRate = sampleRate;
@@ -318,8 +328,18 @@ ASIOError pwarASIO::createBuffers(ASIOBufferInfo* bufferInfos, long numChannels,
         return ASE_InvalidParameter;
     }
     
-    activeInputs = 0;
-    activeOutputs = 0;
+    // Reject duplicate channels before indexing the per-channel arrays.
+    bool seenInputs[kNumInputs] = {};
+    bool seenOutputs[kNumOutputs] = {};
+    for (long i = 0; i < numChannels; ++i) {
+        const auto& channel = bufferInfos[i];
+        const long limit = channel.isInput ? kNumInputs : kNumOutputs;
+        bool* seen = channel.isInput ? seenInputs : seenOutputs;
+        if (channel.channelNum < 0 || channel.channelNum >= limit || seen[channel.channelNum])
+            return ASE_InvalidParameter;
+        seen[channel.channelNum] = true;
+    }
+    disposeBuffers();
     blockFrames = bufferSize;
     
     // Update latencies and timing based on new buffer size
@@ -332,7 +352,7 @@ ASIOError pwarASIO::createBuffers(ASIOBufferInfo* bufferInfos, long numChannels,
             if (info->channelNum < 0 || info->channelNum >= kNumInputs)
                 goto error;
             inMap[activeInputs] = info->channelNum;
-            inputBuffers[activeInputs] = new float[blockFrames * 2];
+            inputBuffers[activeInputs] = new float[blockFrames * 2]();
             if (inputBuffers[activeInputs]) {
                 info->buffers[0] = inputBuffers[activeInputs];
                 info->buffers[1] = inputBuffers[activeInputs] + blockFrames;
@@ -350,7 +370,7 @@ error:
             if (info->channelNum < 0 || info->channelNum >= kNumOutputs)
                 goto error;
             outMap[activeOutputs] = info->channelNum;
-            outputBuffers[activeOutputs] = new float[blockFrames * 2];
+            outputBuffers[activeOutputs] = new float[blockFrames * 2]();
             if (outputBuffers[activeOutputs]) {
                 info->buffers[0] = outputBuffers[activeOutputs];
                 info->buffers[1] = outputBuffers[activeOutputs] + blockFrames;
@@ -373,10 +393,11 @@ error:
     this->callbacks = callbacks;
     // Initialize the router with the number of output channels
     pwar_router_init(&router, PWAR_MAX_CHANNELS);
-    input_buffers = new float[PWAR_MAX_CHANNELS * blockFrames];
-    output_buffers = new float[PWAR_MAX_CHANNELS * blockFrames];
+    input_buffers = new float[PWAR_MAX_CHANNELS * blockFrames]();
+    output_buffers = new float[PWAR_MAX_CHANNELS * blockFrames]();
 
-    if (callbacks->asioMessage(kAsioSupportsTimeInfo, 0, 0, 0)) {
+    if (callbacks->asioMessage && callbacks->bufferSwitchTimeInfo &&
+        callbacks->asioMessage(kAsioSupportsTimeInfo, 0, 0, 0)) {
         timeInfoMode = true;
         asioTime.timeInfo.speed = 1.0;
         asioTime.timeInfo.systemTime.hi = asioTime.timeInfo.systemTime.lo = 0;
@@ -388,6 +409,10 @@ error:
         asioTime.timeCode.flags = kTcValid | kTcRunning;
     } else {
         timeInfoMode = false;
+        if (!callbacks->bufferSwitch) {
+            disposeBuffers();
+            return ASE_InvalidParameter;
+        }
     }
     return ASE_OK;
 }
@@ -489,155 +514,176 @@ ASIOError pwarASIO::outputReady() {
     return ASE_NotPresent;
 }
 
-void pwarASIO::udp_packet_listener() {
-    WSADATA wsaData;
-    SOCKET sockfd;
-    sockaddr_in servaddr{}, cliaddr{};
-    int n;
-    socklen_t len;
-    char buffer[2048];
+void pwarASIO::processAudioBlock(bool silence) {
+    for (long i = 0; i < activeInputs; ++i) {
+        float* dest = inputBuffers[i] + (toggle ? blockFrames : 0);
+        if (silence) {
+            memset(dest, 0, blockFrames * sizeof(float));
+        } else {
+            memcpy(dest, input_buffers + inMap[i] * blockFrames, blockFrames * sizeof(float));
+        }
+    }
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+    theSystemTime.lo = static_cast<unsigned long>(ns);
+    theSystemTime.hi = static_cast<unsigned long>(static_cast<uint64_t>(ns) >> 32);
+    samplePosition += blockFrames;
+    if (timeInfoMode) {
+        bufferSwitchX();
+    } else {
+        callbacks->bufferSwitch(toggle, ASIOFalse);
+    }
+    // Hosts may enable only one output, reverse channel order, or use inputs only.
+    memset(output_buffers, 0, PWAR_MAX_CHANNELS * blockFrames * sizeof(float));
+    for (long i = 0; i < activeOutputs; ++i) {
+        memcpy(output_buffers + outMap[i] * blockFrames,
+               outputBuffers[i] + (toggle ? blockFrames : 0), blockFrames * sizeof(float));
+    }
+    toggle = toggle ? 0 : 1;
+}
 
-    // --- Raise thread priority and register with MMCSS ---
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+void pwarASIO::udp_packet_listener() {
     DWORD mmcssTaskIndex = 0;
     HANDLE mmcssHandle = AvSetMmThreadCharacteristicsA("Pro Audio", &mmcssTaskIndex);
-    // Debug: verify thread priority and MMCSS registration
-    int prio = GetThreadPriority(GetCurrentThread());
-    if (prio != THREAD_PRIORITY_TIME_CRITICAL) {
-        pwarASIOLog::Send("Warning: Thread priority not set to TIME_CRITICAL!");
-    } else {
-        pwarASIOLog::Send("Thread priority set to TIME_CRITICAL.");
-    }
-    if (!mmcssHandle) {
-        pwarASIOLog::Send("Warning: MMCSS registration failed!");
-    } else {
-        pwarASIOLog::Send("MMCSS registration succeeded.");
-    }
-    // -----------------------------------------------------
+    const bool timerResolutionSet = timeBeginPeriod(1) == TIMERR_NOERROR;
+    using Clock = std::chrono::steady_clock;
+    const auto blockPeriod = std::chrono::duration_cast<Clock::duration>(
+        std::chrono::duration<double>(blockFrames / sampleRate));
+    // Healthy streams remain entirely paced by the Pi. Only fall back after
+    // 100 ms without a complete buffer, so packet jitter does not add callbacks.
+    const auto networkGrace = std::chrono::milliseconds(100);
+    auto nextCallback = Clock::now();
+    bool offline = true;
+    WSAEVENT events[] = {udpStopEvent, udpReceiveEvent};
+    pwar_packet_t outputPackets[32];
 
-    if (WSAStartup(MAKEWORD(2,2), &wsaData) != 0) {
-        if (mmcssHandle) AvRevertMmThreadCharacteristics(mmcssHandle);
-        return;
-    }
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (sockfd == INVALID_SOCKET) {
-        WSACleanup();
-        if (mmcssHandle) AvRevertMmThreadCharacteristics(mmcssHandle);
-        return;
-    }
-    // Set SO_RCVBUF to minimal size for low latency
-    int rcvbuf = 1024; // 1 KB
-    setsockopt(sockfd, SOL_SOCKET, SO_RCVBUF, (const char*)&rcvbuf, sizeof(rcvbuf));
-    // Disable UDP connection reset behavior
-    DWORD bytesReturned = 0;
-    BOOL bNewBehavior = FALSE;
-    WSAIoctl(sockfd, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), NULL, 0, &bytesReturned, NULL, NULL);
-    memset(&servaddr, 0, sizeof(servaddr));
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_addr.s_addr = INADDR_ANY;
-    servaddr.sin_port = htons(8321);
-    if (bind(sockfd, reinterpret_cast<sockaddr*>(&servaddr), sizeof(servaddr)) == SOCKET_ERROR) {
-        closesocket(sockfd);
-        WSACleanup();
-        return;
-    }
-    udpListenerRunning = true;
-    pwar_packet_t output_packets[32];
-    uint32_t packets_to_send = 0;
-    while (udpListenerRunning) {
-        len = sizeof(cliaddr);
-        WSABUF wsaBuf;
-        wsaBuf.buf = buffer;
-        wsaBuf.len = sizeof(buffer);
-        DWORD bytesReceived = 0;
-        DWORD flags = 0;
-        int res = WSARecvFrom(sockfd, &wsaBuf, 1, &bytesReceived, &flags, reinterpret_cast<sockaddr*>(&cliaddr), &len, NULL, NULL);
-        if (res == 0 && bytesReceived >= sizeof(pwar_packet_t)) {
-            pwar_packet_t pkt;
-            memcpy(&pkt, buffer, sizeof(pwar_packet_t));
+    while (udpListenerRunning.load()) {
+        auto remaining = nextCallback - Clock::now();
+        const DWORD timeout = remaining <= Clock::duration::zero() ? 0 :
+            static_cast<DWORD>(std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count() + 1);
+        const DWORD wait = WSAWaitForMultipleEvents(2, events, FALSE, timeout, FALSE);
+        if (!udpListenerRunning.load() || wait == WSA_WAIT_EVENT_0) break;
+        if (wait == WSA_WAIT_FAILED) break;
 
-            uint32_t chunk_size = pkt.n_samples;
-            pkt.num_packets =  blockFrames / chunk_size;
-            latency_manager_process_packet_client(&pkt);
+        if (wait == WSA_WAIT_EVENT_0 + 1) {
+            WSANETWORKEVENTS networkEvents{};
+            WSAEnumNetworkEvents(udpReceiveSocket, udpReceiveEvent, &networkEvents);
+            if (networkEvents.lNetworkEvents & FD_READ) {
+                pwar_packet_t packet{};
+                // The socket is nonblocking after WSAEventSelect. One receive
+                // re-arms FD_READ, including when more datagrams are queued.
+                const int received = recvfrom(udpReceiveSocket, reinterpret_cast<char*>(&packet),
+                                              sizeof(packet), 0, nullptr, nullptr);
+                const uint32_t chunkSize = packet.n_samples;
+                if (received == sizeof(packet) && chunkSize >= PWAR_PACKET_MIN_CHUNK_SIZE &&
+                    chunkSize <= PWAR_PACKET_MAX_CHUNK_SIZE && blockFrames % chunkSize == 0 &&
+                    packet.packet_index < static_cast<uint32_t>(blockFrames) / chunkSize &&
+                    udpListenerRunning.load()) {
+                    packet.num_packets = blockFrames / chunkSize;
+                    latency_manager_process_packet_client(&packet);
+                    const int samplesReady = pwar_router_process_streaming_packet(
+                        &router, &packet, input_buffers, blockFrames, PWAR_MAX_CHANNELS);
+                    if (samplesReady > 0) {
+                        latency_manager_start_audio_cbk_begin();
+                        processAudioBlock(false);
+                        latency_manager_start_audio_cbk_end();
+                        offline = false;
+                        nextCallback = Clock::now() + networkGrace;
 
-            int samples_ready = pwar_router_process_streaming_packet(&router, &pkt, input_buffers, blockFrames, PWAR_MAX_CHANNELS);
-
-            if (started && (samples_ready > 0)) {
-                uint32_t seq = pkt.seq;
-
-                latency_manager_start_audio_cbk_begin();
-
-                // Do the ASIO things.. input in input_buffers
-                size_t to_copy = blockFrames;
-
-                for (long i = 0; i < activeInputs; ++i) {
-                    float* dest = inputBuffers[i] + (toggle ? blockFrames : 0);
-
-                    // Copy the first input channel..
-                    memcpy(dest, input_buffers, to_copy * sizeof(float));
-
-                    // Zero out the rest
-                    for (size_t j = to_copy; j < blockFrames; ++j)
-                        dest[j] = 0.0f;
-                }
-                samplePosition += blockFrames;
-
-                if (timeInfoMode) {
-                    bufferSwitchX();
-                } else {
-                    callbacks->bufferSwitch(toggle, ASIOFalse);
-                }
-
-                latency_manager_start_audio_cbk_end();
-
-                float* outputSamplesCh1 = outputBuffers[0] + (toggle ? blockFrames : 0);
-                float* outputSamplesCh2 = outputBuffers[1] + (toggle ? blockFrames : 0);
-
-                memcpy(output_buffers, outputSamplesCh1, blockFrames * sizeof(float));
-                memcpy(output_buffers + blockFrames, outputSamplesCh2, blockFrames * sizeof(float));
-
-                // Send the result
-                pwar_router_send_buffer(&router, chunk_size, output_buffers, samples_ready, PWAR_MAX_CHANNELS, output_packets, 32, &packets_to_send);
-
-                uint64_t timestamp = latency_manager_timestamp_now();
-                for (uint32_t i = 0; i < packets_to_send; ++i) {
-                    output_packets[i].seq = seq;
-                    output_packets[i].timestamp = timestamp;
-                    output(output_packets[i]);
-                }
-                toggle = toggle ? 0 : 1;
-
-                pwar_latency_info_t latency_info;
-                if (latency_manager_time_for_sending_latency_info(&latency_info)) {
-                    // Send the latency info over the socket
-                    if (udpSendSocket != INVALID_SOCKET) {
-                        WSABUF buffer;
-                        buffer.buf = reinterpret_cast<CHAR*>(&latency_info);
-                        buffer.len = sizeof(latency_info);
-                        DWORD bytesSent = 0;
-                        int flags = 0;
-                        WSASendTo(udpSendSocket, &buffer, 1, &bytesSent, flags,
-                                  reinterpret_cast<sockaddr*>(&udpSendAddr), sizeof(udpSendAddr), NULL, NULL);
+                        if (activeOutputs > 0) {
+                            uint32_t packetsToSend = 0;
+                            pwar_router_send_buffer(&router, chunkSize, output_buffers, samplesReady,
+                                                    PWAR_MAX_CHANNELS, outputPackets, 32, &packetsToSend);
+                            const uint64_t timestamp = latency_manager_timestamp_now();
+                            for (uint32_t i = 0; i < packetsToSend; ++i) {
+                                outputPackets[i].seq = packet.seq;
+                                outputPackets[i].timestamp = timestamp;
+                                output(outputPackets[i]);
+                            }
+                            pwar_latency_info_t latencyInfo;
+                            if (latency_manager_time_for_sending_latency_info(&latencyInfo)) {
+                                sendto(udpSendSocket, reinterpret_cast<const char*>(&latencyInfo),
+                                       sizeof(latencyInfo), 0, reinterpret_cast<sockaddr*>(&udpSendAddr),
+                                       sizeof(udpSendAddr));
+                            }
+                        }
                     }
                 }
             }
         }
+        // Check the deadline even under malformed/incomplete packet traffic.
+        // All callbacks use this one thread, so fallback and network callbacks
+        // can never run concurrently.
+        if (udpListenerRunning.load() && Clock::now() >= nextCallback) {
+            if (!offline) pwar_router_init(&router, PWAR_MAX_CHANNELS);
+            offline = true;
+            processAudioBlock(true);
+            nextCallback += blockPeriod;
+            if (nextCallback < Clock::now()) nextCallback = Clock::now() + blockPeriod;
+        }
     }
-    closesocket(sockfd);
-    WSACleanup();
+    if (timerResolutionSet) timeEndPeriod(1);
+    if (mmcssHandle) AvRevertMmThreadCharacteristics(mmcssHandle);
 }
 
-void pwarASIO::startUdpListener() {
-    if (!udpListenerRunning) {
-        udpListenerRunning = true;
-        udpListenerThread = std::thread(&pwarASIO::udp_packet_listener, this);
+bool pwarASIO::startUdpListener() {
+    udpStopEvent = WSACreateEvent();
+    udpReceiveEvent = WSACreateEvent();
+    udpReceiveSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udpStopEvent == WSA_INVALID_EVENT || udpReceiveEvent == WSA_INVALID_EVENT ||
+        udpReceiveSocket == INVALID_SOCKET) {
+        strcpy(errorMessage, "Could not create PWAR receive socket/events");
+        stopUdpListener();
+        return false;
     }
+    BOOL exclusive = TRUE;
+    setsockopt(udpReceiveSocket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+               reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
+    int receiveBufferSize = 1024;
+    setsockopt(udpReceiveSocket, SOL_SOCKET, SO_RCVBUF,
+               reinterpret_cast<const char*>(&receiveBufferSize), sizeof(receiveBufferSize));
+    DWORD bytesReturned = 0;
+    BOOL connectionReset = FALSE;
+    WSAIoctl(udpReceiveSocket, SIO_UDP_CONNRESET, &connectionReset, sizeof(connectionReset),
+             nullptr, 0, &bytesReturned, nullptr, nullptr);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(8321);
+    if (bind(udpReceiveSocket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR ||
+        WSAEventSelect(udpReceiveSocket, udpReceiveEvent, FD_READ) == SOCKET_ERROR) {
+        sprintf(errorMessage, "Could not listen on UDP 8321 (Winsock error %d)", WSAGetLastError());
+        stopUdpListener();
+        return false;
+    }
+    udpListenerRunning.store(true);
+    try {
+        udpListenerThread = std::thread(&pwarASIO::udp_packet_listener, this);
+    } catch (const std::exception&) {
+        strcpy(errorMessage, "Could not start PWAR receive thread");
+        stopUdpListener();
+        return false;
+    }
+    return true;
 }
 
 void pwarASIO::stopUdpListener() {
-    udpListenerRunning = false;
-    if (udpListenerThread.joinable()) {
-        udpListenerThread.join();
+    udpListenerRunning.store(false);
+    if (udpStopEvent != WSA_INVALID_EVENT) WSASetEvent(udpStopEvent);
+    if (udpListenerThread.joinable()) udpListenerThread.join();
+    // Nothing can receive, send or invoke the host after the join. Only now
+    // close handles and let stop()/disposeBuffers() return to the host.
+    if (udpReceiveSocket != INVALID_SOCKET) {
+        closesocket(udpReceiveSocket);
+        udpReceiveSocket = INVALID_SOCKET;
+    }
+    if (udpReceiveEvent != WSA_INVALID_EVENT) {
+        WSACloseEvent(udpReceiveEvent);
+        udpReceiveEvent = WSA_INVALID_EVENT;
+    }
+    if (udpStopEvent != WSA_INVALID_EVENT) {
+        WSACloseEvent(udpStopEvent);
+        udpStopEvent = WSA_INVALID_EVENT;
     }
 }
 
@@ -680,10 +726,22 @@ void pwarASIO::initUdpSender() {
     if (udpSendSocket == INVALID_SOCKET && udpWSAInitialized) {
         udpSendSocket = socket(AF_INET, SOCK_DGRAM, 0);
         if (udpSendSocket != INVALID_SOCKET) {
+            // A congested/disconnected peer must not hold up the worker's
+            // shutdown while it is sending the last audio buffer.
+            u_long nonblocking = 1;
+            if (ioctlsocket(udpSendSocket, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+                closesocket(udpSendSocket);
+                udpSendSocket = INVALID_SOCKET;
+                return;
+            }
             memset(&udpSendAddr, 0, sizeof(udpSendAddr));
             udpSendAddr.sin_family = AF_INET;
             udpSendAddr.sin_port = htons(udp_port);
-            inet_pton(AF_INET, udpSendIp.c_str(), &udpSendAddr.sin_addr);
+            if (inet_pton(AF_INET, udpSendIp.c_str(), &udpSendAddr.sin_addr) != 1) {
+                closesocket(udpSendSocket);
+                udpSendSocket = INVALID_SOCKET;
+                return;
+            }
             // Set SO_SNDBUF to minimal size for low latency
             int sndbuf = 1024; // 1 KB
             setsockopt(udpSendSocket, SOL_SOCKET, SO_SNDBUF, (const char*)&sndbuf, sizeof(sndbuf));

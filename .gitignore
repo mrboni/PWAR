@@ -2,6 +2,8 @@ build/
 install/
 dist/
 third_party/asiosdk
+third_party/*.zip
+third_party/sdk-extracted/
 .ccls-cache/
 linux/_out
 protocol/test/_out/

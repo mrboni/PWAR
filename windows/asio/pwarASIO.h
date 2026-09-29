@@ -9,6 +9,8 @@
 #define __PWAR_ASIO_H__
 
 #include "asiosys.h"
+#include <winsock2.h>
+#include <atomic>
 #include <thread>
 #include <string>
 #include "../../protocol/pwar_packet.h"
@@ -71,8 +73,9 @@ private:
     pwar_router_t router;
     void output(const pwar_packet_t& packet);
     void bufferSwitchX();
+    void processAudioBlock(bool silence);
     void udp_packet_listener();
-    void startUdpListener();
+    bool startUdpListener();
     void stopUdpListener();
     void initUdpSender();
     void closeUdpSender();
@@ -104,7 +107,10 @@ private:
     char errorMessage[128]{};
     uint64_t _timestamp = 0;
     std::thread udpListenerThread;
-    bool udpListenerRunning = false;
+    std::atomic<bool> udpListenerRunning{false};
+    SOCKET udpReceiveSocket = INVALID_SOCKET;
+    WSAEVENT udpStopEvent = WSA_INVALID_EVENT;
+    WSAEVENT udpReceiveEvent = WSA_INVALID_EVENT;
     SOCKET udpSendSocket = INVALID_SOCKET;
     bool udpWSAInitialized = false;
     struct sockaddr_in udpSendAddr;

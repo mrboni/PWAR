@@ -1,41 +1,34 @@
-# CMake build for PWAR ASIO driver
-cmake_minimum_required(VERSION 3.10)
-project(PWARASIO LANGUAGES CXX)
+# Build with a separately downloaded Steinberg ASIO SDK.
+set(ASIOSDK_DIR "${CMAKE_SOURCE_DIR}/third_party/asiosdk" CACHE PATH "Steinberg ASIO SDK root")
+if(NOT EXISTS "${ASIOSDK_DIR}/common/iasiodrv.h")
+    message(FATAL_ERROR "ASIO SDK missing. Set ASIOSDK_DIR to the directory containing common/iasiodrv.h")
+endif()
 
-set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS OFF)
-set(CMAKE_CXX_STANDARD 11)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# Source files for the ASIO driver
-set(PWARASIO_SOURCES
-    pwarASIO.cpp
-    pwarASIOLog.cpp
-    ../../../protocol/pwar_router.c
-    ../../../protocol/latency_manager.c
-    ../../../third_party/asiosdk/common/combase.cpp
-    ../../../third_party/asiosdk/common/dllentry.cpp
-    ../../../third_party/asiosdk/common/register.cpp
+add_library(PWARASIO SHARED
+    pwarASIO.cpp pwarASIOLog.cpp pwarASIO.def
+    ../../protocol/pwar_router.c ../../protocol/latency_manager.c
+    "${ASIOSDK_DIR}/common/combase.cpp"
+    "${ASIOSDK_DIR}/common/dllentry.cpp"
+    "${ASIOSDK_DIR}/common/register.cpp"
 )
+target_include_directories(PWARASIO PRIVATE "${ASIOSDK_DIR}/common")
+target_compile_definitions(PWARASIO PRIVATE WIN32 _WINDOWS _CRT_SECURE_NO_WARNINGS NOMINMAX)
+target_link_libraries(PWARASIO PRIVATE ws2_32 avrt winmm ole32 advapi32 user32)
+set_target_properties(PWARASIO PROPERTIES OUTPUT_NAME PWARASIO)
 
-add_library(PWARASIO SHARED ${PWARASIO_SOURCES})
-
-# Set output name to PWARASIO.dll
-set_target_properties(PWARASIO PROPERTIES OUTPUT_NAME "PWARASIO")
-
-# Add the .def file for proper symbol exports
-set_target_properties(PWARASIO PROPERTIES LINK_FLAGS "/DEF:${CMAKE_CURRENT_SOURCE_DIR}/pwarASIO.def")
-
-target_include_directories(PWARASIO PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/asiosdk/common
-)
-
-target_compile_definitions(PWARASIO PRIVATE WIN32 _WINDOWS _CRT_SECURE_NO_DEPRECATE)
-
-target_link_libraries(PWARASIO PRIVATE odbc32 odbccp32 winmm)
-
-add_custom_command(TARGET PWARASIO POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        $<TARGET_FILE:PWARASIO>
-        Z:/music_production/PWAR/
-)
+if(BUILD_TESTING)
+    add_executable(pwar_asio_lifecycle_test tests/lifecycle.cpp)
+    target_include_directories(pwar_asio_lifecycle_test PRIVATE "${ASIOSDK_DIR}/common")
+    target_compile_definitions(pwar_asio_lifecycle_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(pwar_asio_lifecycle_test PRIVATE ws2_32 ole32)
+    add_dependencies(pwar_asio_lifecycle_test PWARASIO)
+    # Isolate the tests from the workstation's actual Pi destination.
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/test-profile")
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/test-profile/pwarASIO.cfg" "udp_send_ip=127.0.0.1\n")
+    foreach(scenario offline receive lifecycle bind-conflict)
+        add_test(NAME asio_${scenario} COMMAND pwar_asio_lifecycle_test $<TARGET_FILE:PWARASIO> ${scenario})
+        set_tests_properties(asio_${scenario} PROPERTIES
+            TIMEOUT 30 RUN_SERIAL TRUE
+            ENVIRONMENT "USERPROFILE=${CMAKE_CURRENT_BINARY_DIR}/test-profile")
+    endforeach()
+endif()
